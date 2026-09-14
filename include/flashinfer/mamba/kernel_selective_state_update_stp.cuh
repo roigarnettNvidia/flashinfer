@@ -218,17 +218,23 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
         rState = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
 
       float new_state_values[load_state_t::count];
-      // Pair only complete, unscaled 16-bit updates; retain scalar FP32 arithmetic.
+      // Pair only complete, unscaled 16-bit updates for packed FP32 arithmetic.
       if constexpr (sizeof(state_t) == 2 && sizeof(input_t) == 2 && !scaleState &&
                     load_state_t::count % 2 == 0) {
 #pragma unroll
         for (int ii = 0; ii < load_state_t::count; ii += 2) {
           auto const state_pair = make_float2(toFloat(rState.val[ii]), toFloat(rState.val[ii + 1]));
           auto const B_pair = make_float2(toFloat(sram.B[i + ii]), toFloat(sram.B[i + ii + 1]));
-          auto const dB_pair = make_float2(B_pair.x * dt_value, B_pair.y * dt_value);
-          auto const dBx_pair = make_float2(dB_pair.x * x_value, dB_pair.y * x_value);
-          auto const new_state_pair = make_float2(state_pair.x * dA + dBx_pair.x,
-                                                 state_pair.y * dA + dBx_pair.y);
+          auto const dt_pair = make_float2(dt_value, dt_value);
+          auto const x_pair = make_float2(x_value, x_value);
+          auto const dA_pair = make_float2(dA, dA);
+          auto const zero_pair = make_float2(0.f, 0.f);
+          float2 dB_pair;
+          fma_f32x2(dB_pair, B_pair, dt_pair, zero_pair);
+          float2 dBx_pair;
+          fma_f32x2(dBx_pair, dB_pair, x_pair, zero_pair);
+          float2 new_state_pair;
+          fma_f32x2(new_state_pair, state_pair, dA_pair, dBx_pair);
           new_state_values[ii] = new_state_pair.x;
           new_state_values[ii + 1] = new_state_pair.y;
         }
@@ -538,10 +544,16 @@ __device__ __forceinline__ void consumer_func_vertical(
               state_pair = make_float2(toFloat(rState_ptr[0]), toFloat(rState_ptr[1]));
             }
             auto const B_pair = make_float2(toFloat(rB_ptr[0]), toFloat(rB_ptr[1]));
-            auto const dB_pair = make_float2(B_pair.x * dt_value, B_pair.y * dt_value);
-            auto const dBx_pair = make_float2(dB_pair.x * x_value, dB_pair.y * x_value);
-            auto const new_state_pair = make_float2(state_pair.x * dA + dBx_pair.x,
-                                                   state_pair.y * dA + dBx_pair.y);
+            auto const dt_pair = make_float2(dt_value, dt_value);
+            auto const x_pair = make_float2(x_value, x_value);
+            auto const dA_pair = make_float2(dA, dA);
+            auto const zero_pair = make_float2(0.f, 0.f);
+            float2 dB_pair;
+            fma_f32x2(dB_pair, B_pair, dt_pair, zero_pair);
+            float2 dBx_pair;
+            fma_f32x2(dBx_pair, dB_pair, x_pair, zero_pair);
+            float2 new_state_pair;
+            fma_f32x2(new_state_pair, state_pair, dA_pair, dBx_pair);
             new_state_values[0] = new_state_pair.x;
             new_state_values[1] = new_state_pair.y;
           } else {
@@ -987,12 +999,15 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto const B_pair = make_float2(toFloat(rB_ptr[0]), toFloat(rB_ptr[1]));
         auto const dt_pair = make_float2(dt_value, dt_value);
         auto const x_pair = make_float2(x_value, x_value);
-        auto const dB_pair = make_float2(B_pair.x * dt_pair.x, B_pair.y * dt_pair.y);
-        auto const dBx_pair = make_float2(dB_pair.x * x_pair.x, dB_pair.y * x_pair.y);
+        auto const zero_pair = make_float2(0.f, 0.f);
+        float2 dB_pair;
+        fma_f32x2(dB_pair, B_pair, dt_pair, zero_pair);
+        float2 dBx_pair;
+        fma_f32x2(dBx_pair, dB_pair, x_pair, zero_pair);
         auto const dA = __expf(A_value * dt_value);
         auto const dA_pair = make_float2(dA, dA);
-        auto const new_state_pair = make_float2(state_pair.x * dA_pair.x + dBx_pair.x,
-                                                state_pair.y * dA_pair.y + dBx_pair.y);
+        float2 new_state_pair;
+        fma_f32x2(new_state_pair, state_pair, dA_pair, dBx_pair);
         float const new_state_values[2] = {new_state_pair.x, new_state_pair.y};
         float const C_values[2] = {toFloat(rC_ptr[0]), toFloat(rC_ptr[1])};
 
