@@ -98,7 +98,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   [[maybe_unused]] auto* __restrict__ state_scale =
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
-  // Load device-side Philox seed once into a register
+  // Load device-side rounding seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
@@ -206,7 +206,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
 
     // update the out value and compute the max state and state sum.
-    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // Weyl produces 4 threshold words per call; reuse across up to 4 consecutive elements.
     // Refresh every time the ii-within-outer-loop crosses a multiple-of-4 boundary.
     // Works for any count (1, 2, 4, 8, ...): count<=4 refreshes once per outer iter (or less),
     // count>4 (e.g. count=8 for bf16+DSTATE=256) refreshes count/4 times per outer iter.
@@ -220,8 +220,8 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
       for (int ii = 0; ii < load_state_t::count; ii++) {
         if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
           if (ii % 4 == 0)
-            philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + ii,
-                                            rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+            weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + ii,
+                              rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
         }
 
         auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
@@ -234,7 +234,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
           new_state_max = fmaxf(new_state_max, fabsf(new_state));
           rNewState[iter * load_state_t::count + ii] = new_state;
         } else if constexpr (PHILOX_ROUNDS > 0) {
-          rState.val[ii] = cvt_rs_f16_f32(new_state, rand_ints[ii % 4] & 0x1FFFu);
+          rState.val[ii] = cvt_rs_f16_f32(new_state, rand_ints[ii % 4] >> 19);
         } else {
           convertAndStore(&rState.val[ii], new_state);
         }
@@ -492,7 +492,7 @@ __device__ __forceinline__ void consumer_func_vertical(
       // code)
       [[maybe_unused]] float rNewState[scaleState ? DSTATE / warpSize : 1];
 
-      // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+      // Weyl produces 4 threshold words per call; reuse across up to 4 consecutive elements.
       // Refresh when e % 4 == 0. stateValuesPerBank is constexpr so all branches compile away.
       [[maybe_unused]] uint32_t rand_ints[4];
       if constexpr (sizeof(state_t) == sizeof(input_t)) {
@@ -512,9 +512,8 @@ __device__ __forceinline__ void consumer_func_vertical(
           for (int e = 0; e < stateValuesPerBank; e++) {
             if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
               if (e % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                                rand_ints[0], rand_ints[1], rand_ints[2],
-                                                rand_ints[3]);
+                weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                  rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
             }
 
             float state_value;
@@ -536,7 +535,7 @@ __device__ __forceinline__ void consumer_func_vertical(
               new_state_max = fmaxf(new_state_max, fabsf(new_state));
               rNewState[iter * stateValuesPerBank + e] = new_state;
             } else if constexpr (PHILOX_ROUNDS > 0) {
-              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] >> 19);
             } else {
               convertAndStore(&rState_ptr[e], new_state);
             }
@@ -556,9 +555,8 @@ __device__ __forceinline__ void consumer_func_vertical(
           for (int e = 0; e < stateValuesPerBank; e++) {
             if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
               if (e % 4 == 0)
-                philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                                rand_ints[0], rand_ints[1], rand_ints[2],
-                                                rand_ints[3]);
+                weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                  rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
             }
 
             float state_value;
@@ -579,7 +577,7 @@ __device__ __forceinline__ void consumer_func_vertical(
               new_state_max = fmaxf(new_state_max, fabsf(new_state));
               rNewState[iter * stateValuesPerBank + e] = new_state;
             } else if constexpr (PHILOX_ROUNDS > 0) {
-              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] & 0x1FFFu);
+              rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[e % 4] >> 19);
             } else {
               convertAndStore(&rState_ptr[e], new_state);
             }
@@ -653,7 +651,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   [[maybe_unused]] auto* __restrict__ state_scale =
       reinterpret_cast<state_scale_t*>(params.state_scale);
 
-  // Load device-side Philox seed once into a register
+  // Load device-side rounding seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
@@ -917,7 +915,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
     constexpr auto bankSize = sizeof(uint32_t);
     constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
     constexpr auto numBanks = 32;
-    // Philox-4x32 produces 4 random ints per call; reuse across up to 4 consecutive elements.
+    // Weyl produces 4 threshold words per call; reuse across up to 4 consecutive elements.
     // flat_e tracks position across outer+inner loops; refresh every 4 elements.
     // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
     [[maybe_unused]] uint32_t rand_ints[4];
@@ -945,10 +943,10 @@ __device__ __forceinline__ void consumer_func_horizontal(
         for (int e = 0; e < stateValuesPerBank; e++) {
           int flat_e = item + e;
           if constexpr (PHILOX_ROUNDS > 0) {
-            if (flat_e % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                              rand_ints[0], rand_ints[1], rand_ints[2],
-                                              rand_ints[3]);
+            if (flat_e % 4 == 0) {
+              weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+            }
           }
 
           float state_value;
@@ -968,7 +966,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
           if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
             new_state_values[e] = new_state;
           } else if constexpr (PHILOX_ROUNDS > 0) {
-            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] >> 19);
           } else {
             convertAndStore(&rState_ptr[e], new_state);
           }
@@ -976,7 +974,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
         }
         if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
           uint32_t const rbits =
-              (rand_ints[item % 4] & 0x1FFFu) | ((rand_ints[(item + 1) % 4] & 0x1FFFu) << 16);
+              (rand_ints[item % 4] >> 19) | ((rand_ints[(item + 1) % 4] >> 19) << 16);
           rState = cvt_rs_f16x2_f32(new_state_values[0], new_state_values[1], rbits);
         }
         *sState_ptr = rState;
@@ -997,9 +995,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
           int flat_e = item + e;
           if constexpr (PHILOX_ROUNDS > 0) {
             if (flat_e % 4 == 0)
-              philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                              rand_ints[0], rand_ints[1], rand_ints[2],
-                                              rand_ints[3]);
+              weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + e,
+                                rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
           }
 
           float state_value;
@@ -1018,7 +1015,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
           // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
           if constexpr (PHILOX_ROUNDS > 0) {
-            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
+            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] >> 19);
           } else {
             convertAndStore(&rState_ptr[e], new_state);
           }
@@ -1049,7 +1046,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
 
-  // Load device-side Philox seed once into a register
+  // Load device-side rounding seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
 
   int const nheads = params.nheads;
