@@ -941,6 +941,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
         uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
         auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
+        [[maybe_unused]] float new_state_values[stateValuesPerBank];
         for (int e = 0; e < stateValuesPerBank; e++) {
           int flat_e = item + e;
           if constexpr (PHILOX_ROUNDS > 0) {
@@ -964,13 +965,19 @@ __device__ __forceinline__ void consumer_func_horizontal(
           auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
-          // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
-          if constexpr (PHILOX_ROUNDS > 0) {
+          if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
+            new_state_values[e] = new_state;
+          } else if constexpr (PHILOX_ROUNDS > 0) {
             rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] & 0x1FFFu);
           } else {
             convertAndStore(&rState_ptr[e], new_state);
           }
           out_value += new_state * C_value;
+        }
+        if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
+          uint32_t const rbits =
+              (rand_ints[item % 4] & 0x1FFFu) | ((rand_ints[(item + 1) % 4] & 0x1FFFu) << 16);
+          rState = cvt_rs_f16x2_f32(new_state_values[0], new_state_values[1], rbits);
         }
         *sState_ptr = rState;
       }
