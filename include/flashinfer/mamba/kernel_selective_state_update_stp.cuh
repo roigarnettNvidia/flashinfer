@@ -217,6 +217,30 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
       if (state_batch != params.pad_slot_id)
         rState = *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]);
 
+      float new_state_values[load_state_t::count];
+      // Pair only complete, unscaled 16-bit updates; retain scalar FP32 arithmetic.
+      if constexpr (sizeof(state_t) == 2 && sizeof(input_t) == 2 && !scaleState &&
+                    load_state_t::count % 2 == 0) {
+#pragma unroll
+        for (int ii = 0; ii < load_state_t::count; ii += 2) {
+          auto const state_pair = make_float2(toFloat(rState.val[ii]), toFloat(rState.val[ii + 1]));
+          auto const B_pair = make_float2(toFloat(sram.B[i + ii]), toFloat(sram.B[i + ii + 1]));
+          auto const dB_pair = make_float2(B_pair.x * dt_value, B_pair.y * dt_value);
+          auto const dBx_pair = make_float2(dB_pair.x * x_value, dB_pair.y * x_value);
+          auto const new_state_pair = make_float2(state_pair.x * dA + dBx_pair.x,
+                                                 state_pair.y * dA + dBx_pair.y);
+          new_state_values[ii] = new_state_pair.x;
+          new_state_values[ii + 1] = new_state_pair.y;
+        }
+      } else {
+        for (int ii = 0; ii < load_state_t::count; ii++) {
+          auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
+          auto B_value = toFloat(sram.B[i + ii]);
+          auto const dB = B_value * dt_value;
+          new_state_values[ii] = state_value * dA + dB * x_value;
+        }
+      }
+
       for (int ii = 0; ii < load_state_t::count; ii++) {
         if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
           if (ii % 4 == 0)
@@ -224,12 +248,8 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
                               rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
         }
 
-        auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
-        auto B_value = toFloat(sram.B[i + ii]);
+        auto const new_state = new_state_values[ii];
         auto C_value = toFloat(sram.C[i + ii]);
-
-        auto const dB = B_value * dt_value;
-        auto const new_state = state_value * dA + dB * x_value;
         if constexpr (scaleState) {
           new_state_max = fmaxf(new_state_max, fabsf(new_state));
           rNewState[iter * load_state_t::count + ii] = new_state;
@@ -509,6 +529,38 @@ __device__ __forceinline__ void consumer_func_vertical(
           uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
           auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
+          float new_state_values[stateValuesPerBank];
+          // Specialize only the arithmetic so conversion and scaled-state handling stay shared.
+          if constexpr (sizeof(state_t) == 2 && !scaleState) {
+            static_assert(stateValuesPerBank == 2);
+            float2 state_pair = make_float2(0.f, 0.f);
+            if constexpr (useStateCache) {
+              state_pair = make_float2(toFloat(rState_ptr[0]), toFloat(rState_ptr[1]));
+            }
+            auto const B_pair = make_float2(toFloat(rB_ptr[0]), toFloat(rB_ptr[1]));
+            auto const dB_pair = make_float2(B_pair.x * dt_value, B_pair.y * dt_value);
+            auto const dBx_pair = make_float2(dB_pair.x * x_value, dB_pair.y * x_value);
+            auto const new_state_pair = make_float2(state_pair.x * dA + dBx_pair.x,
+                                                   state_pair.y * dA + dBx_pair.y);
+            new_state_values[0] = new_state_pair.x;
+            new_state_values[1] = new_state_pair.y;
+          } else {
+            for (int e = 0; e < stateValuesPerBank; e++) {
+              float state_value;
+              if constexpr (!useStateCache) {
+                state_value = 0.f;
+              } else {
+                state_value = toFloat(rState_ptr[e]);
+                if constexpr (scaleState) {
+                  state_value *= state_decode_scale;
+                }
+              }
+              auto const B_value = toFloat(rB_ptr[e]);
+              auto const dB = B_value * dt_value;
+              new_state_values[e] = state_value * dA + dB * x_value;
+            }
+          }
+
           for (int e = 0; e < stateValuesPerBank; e++) {
             if constexpr (PHILOX_ROUNDS > 0 && !scaleState) {
               if (e % 4 == 0)
@@ -516,20 +568,8 @@ __device__ __forceinline__ void consumer_func_vertical(
                                   rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
             }
 
-            float state_value;
-            if constexpr (!useStateCache) {
-              state_value = 0.f;
-            } else {
-              state_value = toFloat(rState_ptr[e]);
-              if constexpr (scaleState) {
-                state_value *= state_decode_scale;
-              }
-            }
-            auto const B_value = toFloat(rB_ptr[e]);
+            auto const new_state = new_state_values[e];
             auto const C_value = toFloat(rC_ptr[e]);
-
-            auto const dB = B_value * dt_value;
-            auto const new_state = state_value * dA + dB * x_value;
 
             if constexpr (scaleState) {
               new_state_max = fmaxf(new_state_max, fabsf(new_state));
@@ -919,7 +959,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
     // flat_e tracks position across outer+inner loops; refresh every 4 elements.
     // Loop is fully unrolled (#pragma unroll), so the modulo and branch compile away.
     [[maybe_unused]] uint32_t rand_ints[4];
-    if constexpr (sizeof(state_t) == sizeof(input_t)) {
+    if constexpr (sizeof(state_t) == 2 && sizeof(state_t) == sizeof(input_t)) {
 #pragma unroll
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
@@ -929,6 +969,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
 
         auto const i = iBegin + ii;
 
+        static_assert(stateValuesPerBank == 2);
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
@@ -939,43 +980,39 @@ __device__ __forceinline__ void consumer_func_horizontal(
         uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
         auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
 
-        [[maybe_unused]] float new_state_values[stateValuesPerBank];
-        for (int e = 0; e < stateValuesPerBank; e++) {
-          int flat_e = item + e;
-          if constexpr (PHILOX_ROUNDS > 0) {
-            if (flat_e % 4 == 0) {
-              weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i + e,
-                                rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-            }
-          }
-
-          float state_value;
-          if constexpr (!useStateCache) {
-            state_value = 0.f;
-          } else {
-            state_value = toFloat(rState_ptr[e]);
-          }
-
-          auto const B_value = toFloat(rB_ptr[e]);
-          auto const C_value = toFloat(rC_ptr[e]);
-
-          auto const dA = __expf(A_value * dt_value);
-          auto const dB = B_value * dt_value;
-          auto const new_state = state_value * dA + dB * x_value;
-
-          if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
-            new_state_values[e] = new_state;
-          } else if constexpr (PHILOX_ROUNDS > 0) {
-            rState_ptr[e] = cvt_rs_f16_f32(new_state, rand_ints[flat_e % 4] >> 19);
-          } else {
-            convertAndStore(&rState_ptr[e], new_state);
-          }
-          out_value += new_state * C_value;
+        float2 state_pair = make_float2(0.f, 0.f);
+        if constexpr (useStateCache) {
+          state_pair = make_float2(toFloat(rState_ptr[0]), toFloat(rState_ptr[1]));
         }
-        if constexpr (PHILOX_ROUNDS > 0 && stateValuesPerBank == 2) {
+        auto const B_pair = make_float2(toFloat(rB_ptr[0]), toFloat(rB_ptr[1]));
+        auto const dt_pair = make_float2(dt_value, dt_value);
+        auto const x_pair = make_float2(x_value, x_value);
+        auto const dB_pair = make_float2(B_pair.x * dt_pair.x, B_pair.y * dt_pair.y);
+        auto const dBx_pair = make_float2(dB_pair.x * x_pair.x, dB_pair.y * x_pair.y);
+        auto const dA = __expf(A_value * dt_value);
+        auto const dA_pair = make_float2(dA, dA);
+        auto const new_state_pair = make_float2(state_pair.x * dA_pair.x + dBx_pair.x,
+                                                state_pair.y * dA_pair.y + dBx_pair.y);
+        float const new_state_values[2] = {new_state_pair.x, new_state_pair.y};
+        float const C_values[2] = {toFloat(rC_ptr[0]), toFloat(rC_ptr[1])};
+
+        if constexpr (PHILOX_ROUNDS > 0) {
+          if (item % 4 == 0)
+            weyl_randint4x_stp(rand_seed, state_ptr_offset + d * DSTATE + i,
+                              rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
+
           uint32_t const rbits =
               (rand_ints[item % 4] >> 19) | ((rand_ints[(item + 1) % 4] >> 19) << 16);
-          rState = cvt_rs_f16x2_f32(new_state_values[0], new_state_values[1], rbits);
+          rState = cvt_rs_f16x2_f32(new_state_pair.x, new_state_pair.y, rbits);
+        }
+
+#pragma unroll
+        for (int e = 0; e < stateValuesPerBank; e++) {
+          auto const new_state = new_state_values[e];
+          if constexpr (PHILOX_ROUNDS == 0) {
+            convertAndStore(&rState_ptr[e], new_state);
+          }
+          out_value += new_state * C_values[e];
         }
         *sState_ptr = rState;
       }
