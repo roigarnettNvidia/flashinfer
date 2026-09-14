@@ -92,6 +92,19 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
   *output = static_cast<int16_t>(__float2int_rn(input));
 }
 
+// FP16-state stochastic rounding uses the upper 13 bits of each threshold word.
+// Use a deliberately weak Weyl sequence: one multiply creates the first word and the
+// remaining words are consecutive points in the same full-period uint32 sequence.
+__device__ __forceinline__ void weyl_randint4x_stp(int64_t seed, int64_t offset, uint32_t& r0,
+                                               uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  constexpr uint32_t step = 0x9E3779B9u;
+  uint32_t const x = static_cast<uint32_t>(seed) + static_cast<uint32_t>(offset) * step;
+  r0 = x;
+  r1 = x + step;
+  r2 = x + 0x3C6EF372u;
+  r3 = x + 0xDAA66D2Bu;
+}
+
 // =============================================================================
 // Philox-4x32 PRNG (matches Triton's tl.randint)
 // =============================================================================
