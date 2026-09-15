@@ -139,7 +139,7 @@ __device__ __forceinline__ void role_load(SramT& sram, int lane,
 
 // =============================================================================
 // convertAndStoreSRVertical — convert float state registers to packed half.
-// When PHILOX_ROUNDS > 0: stochastic rounding via f16x2 pairs + scalar tail.
+// Positive PHILOX_ROUNDS values enable the same Weyl thresholds (pairs + scalar tail).
 // When PHILOX_ROUNDS == 0: plain nearest-even conversion.
 // =============================================================================
 
@@ -153,20 +153,22 @@ __device__ __forceinline__ void convertAndStoreSRVertical(
 #pragma unroll
     for (int k = 0; k < pairedEnd; k += 2) {
       if (k % 4 == 0)
-        philox_randint4x<PHILOX_ROUNDS>(
+        weyl_randint4x_stp(
             rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
             rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-      uint32_t packed = cvt_rs_f16x2_f32(rStateRow[k], rStateRow[k + 1], rand_ints[k / 2]);
+      uint32_t const bits =
+          (rand_ints[k % 4] >> 19) | ((rand_ints[(k + 1) % 4] >> 19) << 16);
+      uint32_t packed = cvt_rs_f16x2_f32(rStateRow[k], rStateRow[k + 1], bits);
       rStateOut.val[k] = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
       rStateOut.val[k + 1] = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
     }
     if constexpr (stateValuesPerThread % 2 == 1) {
       constexpr int k = pairedEnd;
       if (k % 4 == 0)
-        philox_randint4x<PHILOX_ROUNDS>(
+        weyl_randint4x_stp(
             rand_seed, state_ptr_offset + dd * DSTATE + lane * stateValuesPerThread + k,
             rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-      rStateOut.val[k] = cvt_rs_f16_f32(rStateRow[k], rand_ints[k / 2] & 0x1FFFu);
+      rStateOut.val[k] = cvt_rs_f16_f32(rStateRow[k], rand_ints[k % 4] >> 19);
     }
   } else {
 #pragma unroll
