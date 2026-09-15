@@ -120,7 +120,7 @@ __device__ __forceinline__ void fma_f32x2(float2& d, float2 const& a, float2 con
 
 // =============================================================================
 // convertAndStoreSRHorizontal — convert a pair of f32 state values to half.
-// When PHILOX_ROUNDS > 0: stochastic rounding via f16x2.
+// Positive PHILOX_ROUNDS values enable the same Weyl thresholds via f16x2.
 // When PHILOX_ROUNDS == 0: plain nearest-even conversion.
 // e is the pair-aligned index within the tile (must be even).
 // =============================================================================
@@ -133,9 +133,11 @@ __device__ __forceinline__ void convertAndStoreSRHorizontal(state_t& out0, state
   using namespace conversion;
   if constexpr (PHILOX_ROUNDS > 0) {
     if (e % 4 == 0)
-      philox_randint4x<PHILOX_ROUNDS>(rand_seed, state_ptr_offset + dd * DSTATE + col0 + e,
+      weyl_randint4x_stp(rand_seed, state_ptr_offset + dd * DSTATE + col0 + e,
                                       rand_ints[0], rand_ints[1], rand_ints[2], rand_ints[3]);
-    uint32_t packed = cvt_rs_f16x2_f32(s0, s1, rand_ints[e / 2 % 2]);
+    uint32_t const bits =
+        (rand_ints[e % 4] >> 19) | ((rand_ints[(e + 1) % 4] >> 19) << 16);
+    uint32_t packed = cvt_rs_f16x2_f32(s0, s1, bits);
     out0 = __ushort_as_half(static_cast<uint16_t>(packed & 0xFFFFu));
     out1 = __ushort_as_half(static_cast<uint16_t>(packed >> 16));
   } else {
