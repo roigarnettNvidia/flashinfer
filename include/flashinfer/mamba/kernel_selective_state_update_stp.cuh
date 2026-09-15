@@ -1163,7 +1163,11 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     });
   } else {  // consumers
 
-    using load_t = PackedAligned<input_t>;
+    static_assert(consumerWarps >= 2 && consumerWarps % 2 == 0);
+    static_assert(sizeof(input_t) <= sizeof(uint32_t) &&
+                  sizeof(uint32_t) % sizeof(input_t) == 0);
+    using load_t = PackedAligned<input_t, sizeof(uint32_t) / sizeof(input_t)>;
+    static_assert(DSTATE % load_t::count == 0);
 
     // Unblock the producer
 #pragma unroll
@@ -1184,17 +1188,19 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
       dt_value = thresholded_softplus(dt_value);
     }
 
-    if (warp == 0) {  // Load B
-      for (auto d = lane * load_t::count; d < DSTATE; d += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.B[d]);
+    // Even warps stage B and odd warps stage C, using 4-byte chunks per lane.
+    constexpr auto elementsPerWarp = warpSize * load_t::count;
+    constexpr auto loaderStride = (consumerWarps / 2) * elementsPerWarp;
+    for (auto offset = (warp / 2) * elementsPerWarp + lane * load_t::count;
+         offset < DSTATE; offset += loaderStride) {
+      if (warp % 2 == 0) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.B[offset]);
         *dst = *reinterpret_cast<load_t const*>(
-            &B[batch * params.B_stride_batch + group * DSTATE + d]);
-      }
-    } else if (warp == 1) {  // Load C
-      for (auto i = lane * load_t::count; i < DSTATE; i += warpSize * load_t::count) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
+            &B[batch * params.B_stride_batch + group * DSTATE + offset]);
+      } else {
+        auto* dst = reinterpret_cast<load_t*>(&sram.C[offset]);
         *dst = *reinterpret_cast<load_t const*>(
-            &C[batch * params.C_stride_batch + group * DSTATE + i]);
+            &C[batch * params.C_stride_batch + group * DSTATE + offset]);
       }
     }
 
