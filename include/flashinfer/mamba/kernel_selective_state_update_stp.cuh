@@ -853,7 +853,7 @@ template <typename input_t, typename weight_t, typename matrixA_t,
           int dim, int dstate, int stageCols, uint8_t numStages>
 struct SharedStorageHorizontal {
   alignas(128) state_t state[numStages][dim * stageCols];
-  alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
+  alignas(alignof(PackedAligned<float>)) float B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
@@ -986,8 +986,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
         uint32_t rState = *sState_ptr;
         auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
-        uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
-        auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
+        auto const dB_pair = *reinterpret_cast<float2 const*>(&sram.B[i]);
 
         uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
         auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
@@ -996,12 +995,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
         if constexpr (useStateCache) {
           state_pair = make_float2(toFloat(rState_ptr[0]), toFloat(rState_ptr[1]));
         }
-        auto const B_pair = make_float2(toFloat(rB_ptr[0]), toFloat(rB_ptr[1]));
-        auto const dt_pair = make_float2(dt_value, dt_value);
         auto const x_pair = make_float2(x_value, x_value);
         auto const zero_pair = make_float2(0.f, 0.f);
-        float2 dB_pair;
-        fma_f32x2(dB_pair, B_pair, dt_pair, zero_pair);
         float2 dBx_pair;
         fma_f32x2(dBx_pair, dB_pair, x_pair, zero_pair);
         auto const dA = __expf(A_value * dt_value);
@@ -1058,11 +1053,10 @@ __device__ __forceinline__ void consumer_func_horizontal(
             state_value = toFloat(rState_ptr[e]);
           }
 
-          auto const B_value = toFloat(sram.B[i + e]);
+          auto const dB = sram.B[i + e];
           auto const C_value = toFloat(sram.C[i + e]);
 
           auto const dA = __expf(A_value * dt_value);
-          auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
           // TODO: when stateValuesPerBank == 2, could use cvt_rs_f16x2_f32 for both at once
@@ -1188,15 +1182,29 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
       dt_value = thresholded_softplus(dt_value);
     }
 
-    // Even warps stage B and odd warps stage C, using 4-byte chunks per lane.
+    // Even warps stage B * dt in FP32; odd warps stage C in the input type.
+    // Global loads remain 4-byte chunks per lane.
     constexpr auto elementsPerWarp = warpSize * load_t::count;
     constexpr auto loaderStride = (consumerWarps / 2) * elementsPerWarp;
+    auto const dt_pair = make_float2(dt_value, dt_value);
+    auto const zero_pair = make_float2(0.f, 0.f);
     for (auto offset = (warp / 2) * elementsPerWarp + lane * load_t::count;
          offset < DSTATE; offset += loaderStride) {
       if (warp % 2 == 0) {
-        auto* dst = reinterpret_cast<load_t*>(&sram.B[offset]);
-        *dst = *reinterpret_cast<load_t const*>(
+        auto const values = *reinterpret_cast<load_t const*>(
             &B[batch * params.B_stride_batch + group * DSTATE + offset]);
+        if constexpr (sizeof(state_t) == 2 && sizeof(state_t) == sizeof(input_t)) {
+          // Match the packed consumer's rounding before reusing B * dt across rows.
+          auto const B_pair = make_float2(toFloat(values.val[0]), toFloat(values.val[1]));
+          float2 dB_pair;
+          fma_f32x2(dB_pair, B_pair, dt_pair, zero_pair);
+          *reinterpret_cast<float2*>(&sram.B[offset]) = dB_pair;
+        } else {
+#pragma unroll
+          for (int e = 0; e < load_t::count; ++e) {
+            sram.B[offset + e] = toFloat(values.val[e]) * dt_value;
+          }
+        }
       } else {
         auto* dst = reinterpret_cast<load_t*>(&sram.C[offset]);
         *dst = *reinterpret_cast<load_t const*>(
