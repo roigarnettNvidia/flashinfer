@@ -19,8 +19,9 @@ module has five parts:
 - Top-K from the selection: `top_k_from_candidates` writes the Top-K keys of
   each query row from its selected keys;
 - thresholds from a key sample: `gather_key_sample` and `thresholds_from_sample`;
-- NVFP4 keys and queries: `quantize_write_index_qk_nvfp4` writes the keys to the
-  paged cache and the queries to rows, in one launch.
+- NVFP4 and FP8 keys and queries: `quantize_write_index_qk_nvfp4` and
+  `quantize_write_index_qk_fp8` write the keys to the paged cache and the
+  queries to rows, in one launch.
 
 For decode, a Top-K kernel takes the Top-K from the scores. The Top-K keys feed
 token-sparse attention (below).
@@ -37,6 +38,7 @@ All functions are in `flashinfer.sdsa`.
 | `gather_key_sample(key_cache, block_table, offsets, sample_ends, *, sample_keys, samples_per_run, pages_per_run, key_scales=None, sample_scales=None)` | Copy a strided random sample of the keys of each request into dense rows. |
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
 | `quantize_write_index_qk_nvfp4(key, slots, query, query_rows, *, key_cache, key_scales, packed_query, query_scales)` | Quantize BF16 or FP16 keys and queries to NVFP4: the keys at their cache slots, the queries at their rows. |
+| `quantize_write_index_qk_fp8(key, slots, query, query_rows, *, key_cache, key_scale, fp8_query, query_scale)` | Quantize BF16 or FP16 keys and queries to FP8 E4M3 at per-tensor scales: the keys at their cache slots, the queries at their rows. |
 
 ### Layout
 
@@ -49,6 +51,8 @@ NVFP4 query:       [rows, 64] uint8    E2M1 values, two in a byte
 NVFP4 query_scales:[rows, 8] E4M3      a scale for each 16 values
 NVFP4 key_cache:   [pages, 64, 64] uint8
 NVFP4 key_scales:  [pages, 64, 8] E4M3
+FP8 query:         [rows, 128] E4M3       at one per-tensor scale
+FP8 key_cache:     [pages, 64, 128] E4M3  at one per-tensor scale
 block_table:       [requests, blocks] int32   the pages of each request
 ```
 
@@ -192,6 +196,18 @@ scale: their largest magnitude over 6, with a global scale of 1. It writes the
 `query_scales`. It skips negative slots and rows. Keys and queries are
 quantized the same way, so their scores stay comparable.
 
+#### FP8 keys and queries
+
+`quantize_write_index_qk_fp8` divides each value of a key by `key_scale`, and
+of a query by `query_scale`, in FP32. It saturates the result to +-448 and
+rounds it to the nearest E4M3 value, ties to even. It writes a key at its slot
+`s` (page `s // 64`, row `s % 64`) and a query at its row `r` of `fp8_query`,
+and skips negative slots and rows. The scales are FP32 tensors of one value,
+read on the device, so a CUDA graph replay uses scales written after capture.
+The keys of a cache must all have the same `key_scale`, so that their scores
+stay comparable. One Triton kernel serves SM89 and newer: a program quantizes
+one key or query.
+
 ### Limits
 
 - A key has 128 values, and a page has 64 keys.
@@ -202,14 +218,17 @@ quantized the same way, so their scores stay comparable.
   need SM10x. Off SM10x, `indexer_scores` runs the Triton kernel,
   which takes only BF16 queries and keys, with contiguous rows.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
+- `quantize_write_index_qk_nvfp4` needs SM10x. `quantize_write_index_qk_fp8`
+  runs on SM89 and newer, and takes contiguous rows.
 - `top_k_from_candidates` takes `top_k` below 65536.
 
 ### CUDA graphs
 
 No kernel synchronizes with the host. Run each one once before capture, because
 the CuTe-DSL kernels compile on first use. Queries, keys, pages, lengths,
-thresholds and ranges can change between replays. Zero the `arrivals` of the
-select once: every call leaves them at zero.
+thresholds and ranges can change between replays, and so can the scales of
+`quantize_write_index_qk_fp8`. Zero the `arrivals` of the select once: every
+call leaves them at zero.
 
 ### Tracing
 
@@ -240,6 +259,11 @@ Each API records a trace template, with the op type `sdsa_<api>`.
 - `thresholds_from_sample`: -1 positions and NaN scores.
 - `quantize_write_index_qk_nvfp4`: 0 to 300 keys and 0 to 300 queries, at
   shuffled slots and rows, with negative ones skipped.
+- `quantize_write_index_qk_fp8`, on SM90 and SM10x: BF16 and FP16, 0 to 300
+  keys and 0 to 300 queries, at shuffled slots and rows, with negative ones
+  skipped, and values that saturate. The output must equal a PyTorch reference
+  bit for bit, and nothing else may be written. A CUDA graph replay uses new
+  inputs and new scales.
 - the checks that reject bad shapes, bad layouts off SM10x, bad counters, and
   CuTe DSL older than 4.7.
 
