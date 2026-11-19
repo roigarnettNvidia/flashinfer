@@ -5238,12 +5238,14 @@ def trtllm_batch_decode_with_kv_cache(
                 CakeFmhaAlignedHd64DecodeModule,
                 CakeFmhaAlignedMtpQ32DecodeModule,
                 CakeFmhaDecodeProgramModule,
+                CakeFmhaSuperNvfp4Module,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
                 _run_cake_fmha_aligned_hd256_decode,
                 _run_cake_fmha_aligned_hd64_decode,
                 _run_cake_fmha_aligned_mtp_q32_decode,
                 _run_cake_fmha_decode_program,
+                _run_cake_fmha_super_nvfp4_decode,
                 select_cake_fmha_decode_route,
             )
 
@@ -5282,10 +5284,34 @@ def trtllm_batch_decode_with_kv_cache(
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
                 length_aware_schedule=length_aware_schedule,
+                max_q_len=max_q_len,
+                mask=mask,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
             )
+            if isinstance(cake_module, CakeFmhaSuperNvfp4Module):
+                # FP8 output without LSE: ``out`` is the whole result.
+                _run_cake_fmha_super_nvfp4_decode(
+                    cake_module,
+                    out=out,
+                    query=query,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k_block_scales=k_block_scales,
+                    v_block_scales=v_block_scales,
+                    workspace_buffer=workspace_buffer,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    cum_seq_lens_q=cum_seq_lens_q,
+                    batch_size=batch_size,
+                    max_q_len=max_q_len,
+                    max_kv_len=max_seq_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    enable_pdl=enable_pdl,
+                )
+                return out
             if isinstance(cake_module, CakeFmhaAlignedDecodeModule):
                 # Aligned hd128 q1 decode: a generated in-tree program whose
                 # binding takes the kernel's host parameters positionally plus

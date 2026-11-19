@@ -109,6 +109,43 @@ def _get_prims_ts_module():
     return prims_ts
 
 
+def _get_cake_nvfp4_module():
+    """Import Cake's Nemotron 3.5 Super NVFP4 routes only when requested."""
+    import flashinfer.cake_nvfp4 as cake_nvfp4
+
+    return cake_nvfp4
+
+
+def _cake_nvfp4_unsupported_reason(
+    q_dtype, kv_dtype, out_dtype, num_qo_heads, num_kv_heads, head_dims, page_size
+):
+    """Return why cake (Nemotron 3.5 Super NVFP4 shapes only) skips a case, or None."""
+    cake_nvfp4 = _get_cake_nvfp4_module()
+    if kv_dtype != "nvfp4":
+        return "requires --kv_dtype nvfp4"
+    if q_dtype != torch.float8_e4m3fn or out_dtype != torch.float8_e4m3fn:
+        return "requires FP8 E4M3 query and output"
+    if (num_qo_heads, num_kv_heads) != (
+        cake_nvfp4.NUM_QO_HEADS,
+        cake_nvfp4.NUM_KV_HEADS,
+    ):
+        return f"requires {cake_nvfp4.NUM_QO_HEADS} query and {cake_nvfp4.NUM_KV_HEADS} KV heads"
+    if any(head_dim != cake_nvfp4.HEAD_DIM for head_dim in head_dims):
+        return f"requires head dimension {cake_nvfp4.HEAD_DIM}"
+    if page_size != cake_nvfp4.PAGE_SIZE:
+        return f"requires page_size {cake_nvfp4.PAGE_SIZE}"
+    return None
+
+
+def _cake_nvfp4_resolved_backend(stage):
+    """Name the kernels that served cake since its counters were reset."""
+    cake_nvfp4 = _get_cake_nvfp4_module()
+    kernels = sorted(
+        {kernel for (s, kernel) in cake_nvfp4.route_counts() if s == stage}
+    )
+    return f"cake({'+'.join(kernels)})"
+
+
 def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype, *, is_nvfp4_kv):
     """Return whether PrimTS decode supports the Q/KV/output dtype combination.
 
@@ -384,8 +421,9 @@ def parse_attention_args(line, parser):
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
             "cute-dsl-prims",
+            "cake",
         ],
-        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. cake selects the Cake FMHA backend for the Nemotron 3.5 Super NVFP4-KV geometry. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -927,6 +965,21 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                     "does not support full-mask speculative decode",
                 )
 
+    if "cake" in backends:
+        reason = _cake_nvfp4_unsupported_reason(
+            q_dtype,
+            args.kv_dtype,
+            o_data_type,
+            num_qo_heads,
+            num_kv_heads,
+            (head_dim_qk, head_dim_vo),
+            page_size,
+        )
+        if reason is None and speculative_decode and spec_dec_mask_mode == "full":
+            reason = "uses implicit causal masking and does not support full-mask speculative decode"
+        if reason is not None:
+            _drop_backend(backends, "cake", reason)
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -1069,7 +1122,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
     gqa_multi_ctas_kv_counter_buffer = None
-    if "trtllm-native" in backends:
+    if "trtllm-native" in backends or "cake" in backends:
         counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
             batch_size, num_qo_heads, get_device_sm_count(device)
         )
@@ -1285,6 +1338,26 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 out=out,
                 out_dtype=o_data_type,
             )
+        elif backend == "cake":
+            # As trtllm-native, without the explicit draft-block mask.
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q.contiguous(),
+                kv_cache=kv_cache_nvfp4,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=actual_seq_lens_kv,
+                max_seq_len=s_kv,
+                bmm1_scale=k_scale * scale,
+                bmm2_scale=v_scale,
+                kv_layout="HND",
+                backend="cake",
+                q_len_per_req=s_qo,
+                kv_cache_sf=kv_cache_sf,
+                enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
+                out=out,
+                out_dtype=o_data_type,
+            )
         elif backend == "prims-ts":
             runtime_q = (
                 q.view(batch_size, num_qo_heads, head_dim_qk)
@@ -1318,6 +1391,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
         runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
+        if cur_backend == "cake":
+            _get_cake_nvfp4_module().reset_route_counts()
         if run_refcheck:
             outputs[cur_backend] = (
                 run_backend_wrapper(
@@ -1373,6 +1448,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
+        if cur_backend == "cake":
+            # Report which Cake route served the shape.
+            resolved_backends[cur_backend] = _cake_nvfp4_resolved_backend("decode")
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -1646,6 +1724,20 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
         print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
         backends.remove("trtllm-fmha-v2")
+    if "cake" in backends:
+        reason = _cake_nvfp4_unsupported_reason(
+            q_dtype,
+            args.kv_dtype,
+            o_data_type,
+            num_qo_heads,
+            num_kv_heads,
+            (head_dim_qk, head_dim_vo),
+            page_size,
+        )
+        if reason is None and not causal:
+            reason = "requires causal = True"
+        if reason is not None:
+            _drop_backend(backends, "cake", reason)
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1857,7 +1949,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_bytes = 512 * 1024 * 1024
+    if "cake" in backends:
+        # Cake's Nemotron 3.5 Super prefill route needs this much.
+        workspace_bytes = max(
+            workspace_bytes,
+            _get_cake_nvfp4_module().prefill_workspace_bytes(s_kv),
+        )
+    workspace_buffer = torch.empty(workspace_bytes, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -2092,7 +2191,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
-        elif backend == "trtllm-native":
+        elif backend in ("trtllm-native", "cake"):
             # Compute combined bmm1_scale: q_scale * k_scale * sm_scale
             # For FP8: all scales are float values
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2118,6 +2217,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
                 out_dtype=o_data_type,
+                backend="trtllm-gen" if backend == "trtllm-native" else backend,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
@@ -2205,6 +2305,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             else kv_cache
         )
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
+        if cur_backend == "cake":
+            _get_cake_nvfp4_module().reset_route_counts()
         if run_refcheck:
             outputs[cur_backend] = (
                 run_backend_wrapper(
@@ -2265,6 +2367,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
+        if cur_backend == "cake":
+            # Report which Cake route served the shape.
+            resolved_backends[cur_backend] = _cake_nvfp4_resolved_backend("prefill")
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -2410,7 +2515,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backend = resolved_backends.get(backend, backend)
             display_backend = (
-                f"auto({resolved_backend})" if backend == "auto" else backend
+                f"auto({resolved_backend})"
+                if backend == "auto"
+                else resolved_backend
+                if backend == "cake"
+                else backend
             )
             print_perf_metrics(
                 display_backend, median_time, std_time, tflops, tb_per_sec
